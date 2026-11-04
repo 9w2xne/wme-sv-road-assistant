@@ -116,7 +116,9 @@ Settings are saved in `localStorage` under `wme-svra-settings`.
 
 ## About
 
-Written by **dinkaftac** ([GitHub: 9w2xne](https://github.com/9w2xne)). AI tools helped with code review and documentation; the design decisions, safety boundaries, and final code are the author's.
+Written by **dinkaftac** ([GitHub: 9w2xne](https://github.com/9w2xne)). AI tools (Claude, DeepSeek) helped with code review, safety analysis, and documentation drafting. All design decisions, safety boundaries, and the final code were reviewed and approved by the human author. The script was smoke-tested against the full workflow — Scan, Convert, Flip, Undo — before this beta release.
+
+The author takes responsibility for the script's behaviour and is the point of contact for the Waze guidelines review.
 
 ## Local rules first
 
