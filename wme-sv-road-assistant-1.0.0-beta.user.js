@@ -4,6 +4,10 @@
 // @version      1.0.0-beta
 // @description  Manual assistance for editors: the script proposes draft segments over Street View coverage gaps. Every draft must be reviewed by the editor, aligned to the road centerline, and confirmed against the latest satellite imagery before WME's native Save. Nothing is ever saved automatically, and no existing road is modified.
 // @author       dinkaftac (https://github.com/9w2xne)
+// @license      MIT
+// @homepageURL  https://github.com/9w2xne/wme-sv-road-assistant
+// @supportURL   https://github.com/9w2xne/wme-sv-road-assistant/issues
+// @copyright    2026, dinkaftac
 // @match        https://www.waze.com/editor*
 // @match        https://www.waze.com/*/editor*
 // @match        https://beta.waze.com/editor*
@@ -46,6 +50,9 @@
 
   const NEVER_CONNECT = [5, 10, 15, 16, 18, 19];
   const SAFE_PENDING_LIMIT = 30;
+  // How long an acknowledgement is remembered before the dialog can reappear.
+  // Set to 3 days by default; users who want it longer can adjust.
+  const RESPONSIBILITY_COOLDOWN_MS = 3 * 24 * 60 * 60 * 1000;
   const ORIENT_REACH = 6;
   const ROAD_TYPE_NAMES = {
     1: 'Street', 2: 'Primary Street', 3: 'Freeway', 4: 'Ramp', 5: 'Walking Trail', 6: 'Major Highway', 7: 'Minor Highway',
@@ -76,7 +83,8 @@
     maxSampleTiles: 40,
     cellPx: 2,
     showGuide: false,
-    responsibilityAcknowledged: false
+    responsibilityAcknowledged: false,
+    responsibilityAcknowledgedAt: 0
   };
   let sdk = null;
 
@@ -593,7 +601,19 @@
         if (this.data.roadPreset === 'service') this.data.roadPreset = 'street';
         ['traceProfile', 'smoothStraightenTol', 'smoothSimplifyTol', 'smoothMaxNodes']
           .forEach((k) => { delete this.data[k]; });
-        if (saved.responsibilityAcknowledged === true) this.data.responsibilityAcknowledged = true;
+        // Respect the acknowledgement cooldown: if the last ack was more than
+        // RESPONSIBILITY_COOLDOWN_MS ago, forget it so the user is asked again.
+        if (saved.responsibilityAcknowledged === true) {
+          const ackedAt = saved.responsibilityAcknowledgedAt || 0;
+          const age = Date.now() - ackedAt;
+          if (ackedAt === 0 || age < RESPONSIBILITY_COOLDOWN_MS) {
+            this.data.responsibilityAcknowledged = true;
+            this.data.responsibilityAcknowledgedAt = ackedAt;
+          } else {
+            this.data.responsibilityAcknowledged = false;
+            this.data.responsibilityAcknowledgedAt = 0;
+          }
+        }
         this.save();
       } catch (e) { /* keep defaults */ }
     },
@@ -621,17 +641,23 @@
   };
   const nextId = (p) => `${p}-${String(++State.counters[p]).padStart(3, '0')}`;
 
+  /* ===== SEGMENT CACHE ===== */
+  const SEG_CACHE = new Map();
+  const SEG_CACHE_MAX = 200;
+
   /* ===== WAZE DATA ===== */
   const WazeData = {
     cache: null,
     cacheAt: 0,
     refreshing: null,
+    CACHE_TTL_MS: 2 * 60 * 1000,
 
     all() { return this.cache || []; },
-    invalidate() { this.cache = null; this.cacheAt = 0; },
+    invalidate() { this.cache = null; this.cacheAt = 0; SEG_CACHE.clear(); },
     stale(ttlMs = 1500) { return !this.cache || (Date.now() - this.cacheAt) >= ttlMs; },
 
-    async refresh() {
+    async refresh(force = false) {
+      if (!force && this.cache && (Date.now() - this.cacheAt) < this.CACHE_TTL_MS) return;
       if (this.refreshing) return this.refreshing;
       this.refreshing = (async () => {
         try {
@@ -1333,12 +1359,17 @@
 
   /* ===== GENERATED SEGMENTS ===== */
   async function getSeg(id) {
-    try { let s = sdk.DataModel.Segments.getById({ segmentId: id }); if (isPromise(s)) s = await s; return s || null; }
-    catch (e) { return null; }
-  }
-  async function editCount() {
-    try { let n = sdk.Editing.getUnsavedChangesCount(); if (isPromise(n)) n = await n; return typeof n === 'number' ? n : null; }
-    catch (e) { return null; }
+    const cached = SEG_CACHE.get(id);
+    if (cached) return cached;
+    try {
+      let s = sdk.DataModel.Segments.getById({ segmentId: id });
+      if (isPromise(s)) s = await s;
+      if (s) {
+        SEG_CACHE.set(id, s);
+        if (SEG_CACHE.size > SEG_CACHE_MAX) SEG_CACHE.delete(SEG_CACHE.keys().next().value);
+      }
+      return s || null;
+    } catch (e) { return null; }
   }
 
   const Generated = {
@@ -1446,7 +1477,10 @@
           const total = Math.ceil(toConvert / per);
           const risk = limit > SAFE_PENDING_LIMIT && pending + toConvert > SAFE_PENDING_LIMIT;
           const acked = !!Settings.get('responsibilityAcknowledged');
-          const needsDialog = !acked || ((total > 1 && autoBatch) || risk);
+          const needsDialog = !acked;
+          if (!needsDialog && risk) {
+            UI.notify(`Heads up: you have ${pending} unsaved edits. WME may ask you to save soon.`, 'warn');
+          }
           if (needsDialog) {
             const preset = PRESETS.find((p) => p.key === Settings.get('roadPreset')) || PRESETS[0];
             const go = await UI.confirmConvert({
@@ -1558,7 +1592,7 @@
         }
       } finally { this.busy = false; UI.setBusy(false); }
 
-      WazeData.invalidate(); await WazeData.refresh();
+      WazeData.invalidate(); await WazeData.refresh(true);
       await this.validate();
       this._runCreated = (this._runCreated || 0) + created;
 
@@ -1630,7 +1664,7 @@
           UI.trashCandidate(row.cand);
           res.undone++;
         }
-        WazeData.invalidate(); await WazeData.refresh();
+        WazeData.invalidate(); await WazeData.refresh(true);
       } finally { this.busy = false; }
       return res;
     },
@@ -1988,7 +2022,8 @@
       return new Promise((resolve) => {
         const prevFocus = document.activeElement;
         const riskNote = risk
-          ? `<div class="warnbox"><b>Above ${SAFE_PENDING_LIMIT} pending edits is at your own risk.</b> WME may report that a change is not allowed at this time and will not be sent for review. Lower the limit in Settings, or Save more often, if that happens.</div>` : '';
+          ? `<div class="warnbox"><b>You have a lot of unsaved edits.</b> WME's save system can occasionally fail on large batches and may report that a change is not allowed at this time. Saving every ~10 drafts is recommended to avoid losing work. Lower the <i>WME save-warning threshold</i> in Settings or Save more often if that happens.</div>`
+          : '';
         const remainingAfter = Math.max(0, ticked - count);
         const lead = autoBatch
           ? `<p class="lead">This click will propose up to <b>${count}</b> draft segments, in <b>${total}</b> sub-batch(es) of up to <b>${per}</b>.${remainingAfter > 0 ? ` <b>${remainingAfter}</b> ticked candidate(s) will stay ticked after this click.` : ''} The map returns to your view when finished.</p>`
@@ -2048,7 +2083,10 @@
         if (ack) ack.addEventListener('change', () => { ok.disabled = !ack.checked; });
         ok.addEventListener('click', () => {
           if (ack && !ack.checked) return;
-          if (!acked) Settings.set('responsibilityAcknowledged', true);
+          if (!acked) {
+            Settings.set('responsibilityAcknowledged', true);
+            Settings.set('responsibilityAcknowledgedAt', Date.now());
+          }
           close(true);
         });
         cancel.addEventListener('click', () => close(false));
