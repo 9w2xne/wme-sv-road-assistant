@@ -4,11 +4,13 @@ A manual-assistance userscript for the Waze Map Editor (WME). It proposes **draf
 
 > **Status: 1.0.0 beta.** Not audited by the Waze editing community. Use at your own risk.
 
+Designed to follow the Waze Guidelines for Bulk Editing Scripts: **the tool proposes, the editor decides.**
+
 ## What it does
 
 - Scans the current map view for Street View coverage that has no mapped Waze segment nearby.
 - Traces candidate lines from that coverage and lists them in a table.
-- Splits candidates at existing junctions and flags orientation "seams" where a draft meets a mapped road.
+- Splits candidates at existing junctions and flags A/B direction "seams" where a draft meets a mapped road.
 - On **Convert** (a click from you), creates the ticked candidates as new draft segments in WME.
 
 ## What it never does
@@ -16,7 +18,6 @@ A manual-assistance userscript for the Waze Map Editor (WME). It proposes **draf
 - It never saves. Drafts stay pending until you press WME's own **Save** button.
 - It never edits, deletes or moves existing segments, junctions or turn restrictions.
 - It never connects drafts to existing roads. You connect them by hand.
-- It never copies Google Maps content into the Waze map. See [Street View tile policy](#street-view-tile-policy) below.
 
 ## How candidate shapes are made (please read)
 
@@ -26,12 +27,6 @@ The script requests Street View coverage tiles from `mts*.google.com` and **deri
 - Do not rely on the draft geometry as it is.
 - The tile endpoint is unofficial and may change or stop working without notice.
 - Check your local Waze community's rules on external reference sources before using or sharing this script.
-
-## Street View tile policy
-
-The script reads Street View **coverage tiles** only to determine **where coverage exists** (a binary yes/no per tile, based on pixel alpha presence). No Google Maps content — no road geometry, no imagery, no labels — is copied into the Waze map. The candidate geometries are traced from the *shape of the coverage gap*, not from the tile imagery itself.
-
-If your local Waze community has a stricter policy about external reference sources, consult them before using this script.
 
 ## Requirements
 
@@ -44,85 +39,98 @@ If your local Waze community has a stricter policy about external reference sour
 2. Confirm the installation in Tampermonkey.
 3. Reload WME.
 
-The script is not on Greasyfork, so updates are manual: repeat the steps above for a new version.
+The script is not on Greasyfork, so updates are manual. When replacing the code in the Tampermonkey editor, press **Ctrl+A** before pasting, so the new version does not end up pasted inside the old one.
 
-## Usage
+## Workflow: Scan → Convert → Edit → Save
 
-1. Zoom in to level 16 or higher.
-2. Click **Scan**.
-3. Tick the candidates you want.
-4. Click **Convert**.
-5. For each draft: align it to the road centerline, verify it, connect it to the road network, then press WME's **Save**.
+1. Zoom in to level 16 or higher and click **Scan**.
+2. Tick the candidates you want.
+3. Click **Convert**. One click converts up to the "Drafts per convert click" limit.
+4. For each draft: align it to the road centerline, verify it, connect it to the road network yourself, then press WME's **Save**.
+5. Scan again, or repeat from step 2. You can also scan, convert and edit first, and save once you have finished a pass.
 
-**Undo:** use **Remove** on a candidate, or Ctrl+Z in WME for converted drafts that are still unsaved.
+### How Convert works
 
-Running **Scan** again can join new pieces onto existing candidates or split them at junctions. Do your review after the last scan, and re-check junction dots and A/B ends if you scan again.
+- **Nearest first.** Candidates already on screen are converted first, without moving the map. The rest follow, nearest to your starting view first.
+- **Sub-batches.** A click is processed in silent sub-batches (10 drafts by default) until the per-click cap is reached. This keeps WME's data loading ahead of the conversion.
+- **Waits for the map to load.** Before creating drafts in an area, the script waits until WME has finished loading the map there. Creating a segment before that can turn it into a suggested edit sent for review. A candidate longer than the view is handled by visiting both ends first.
+- **Never stops early.** If the tiles around one candidate are not confirmed after a second, longer wait, that candidate is skipped and stays ticked. The rest of the click carries on, and the final message names the skipped candidates so you can press Convert again.
+- **Returns to where you were.** After the last draft the script pauses for 2 seconds so you can see it, then snaps the map back to your starting view.
 
-## Buttons
+### After conversion
 
-| Button | What it does |
+- A converted candidate becomes a WME draft segment and disappears from the candidate layer at once. Its internal state changes from `Candidate` to `Drafted`.
+- Scanning again over the same area does not propose it again.
+- If you undo the draft segment in WME, the candidate comes back in the list.
+
+### Undo
+
+Use **Remove** on a converted draft, or Ctrl+Z in WME while the drafts are still unsaved. Remove undoes drafts newest-first and refuses if other edits were made after them, so nothing else is lost.
+
+## Reminders (never blocking)
+
+All reminders are friendly checkpoints shown as a dismissible box at the top of the panel. They advise the editor and **never stop a conversion**. The numbers are labelled "script default" and can be changed or switched off in Settings.
+
+- **Over-cap reminder.** If you tick more than the cap, for example 50 against a cap of 30: "You ticked 50; the cap is 30. This click will attempt 30. 20 stay ticked for the next pass."
+- **Unsaved-edits reminder.** WME's total unsaved-edit count includes every kind of edit: new segments, connections, segment info, geometry changes and so on. When it reaches your threshold (script default 300; set 0 to never be reminded), the script reminds you to finish aligning, connecting and saving before adding more. It fires once per crossing and re-arms when the count falls below the threshold.
+- **Unverified-draft reminder.** When the drafts this script created are still unsaved and reach a percentage of the per-click cap (script default 150%; 0 turns it off), it reminds you to align, verify and save them first.
+
+## Panel controls
+
+| Control | What it does |
 |---|---|
 | Scan | Finds candidates in the current view. |
 | Convert | Creates the ticked candidates as new drafts in WME. Nothing is saved. |
-| Remove | Deletes ticked candidates from the list. |
-| Flip (⇆) | Swaps the A and B ends of a candidate. Propagates along a chain of joined candidates. |
+| Remove | Undoes the ticked drafts, or removes ticked rows from the lists. |
+| Flip (⇆) | Swaps the A and B ends of a candidate. Also flips neighbours that share a junction within 3 m. The result carries into the segment when you Convert. |
 | 1W / 2W | Switches a candidate between one-way (A to B) and two-way. |
 | Zoom (⌖) | Zooms the map to a candidate. |
+| Street View | Shows or hides the Street View coverage layer. |
+| Guide | Shows the scanned-area guide frame and tips. |
 
-## Seam column
+### Seams and junction dots
 
-Each candidate row in the table has a **Seam** column showing what is at each end of the line:
-
-| Badge | Meaning |
-|---|---|
-| **Blue dot** | That end is a junction — the trace was cut here because of an existing road or fork. |
-| **✓** | Clean flow at that end — the candidate's orientation matches the adjacent segment. |
-| **⚠ old #123** | Flow conflict with an existing segment that the script cannot reverse. You may need to fix this by hand in WME. |
-
-A row can show a mix (e.g. **✓** on one end, **⚠ old #123** on the other). Blue dots are independent of the ✓/⚠ badges — they indicate *where the trace was cut*, not *whether flow matches*.
-
-## Known limitations
-
-- Drafts are not snapped to any GPS data. Align them by hand.
-- Junction and seam flags rely on the mapped segments next to a candidate. Odd geometry can give a wrong dot or badge, so check each one.
-- Seam badges are not refreshed after a flip. The badge reflects the candidate's state at creation time; the converted draft is unaffected.
-- Large areas are slow to scan. Work in smaller views.
-- The Settings panel collapses when a setting is changed. Reopen it to adjust another setting.
+- A blue dot marks an end that is a junction with a mapped road or another candidate. It stays on the same physical end when you flip.
+- A seam badge shows whether the direction is clean where a draft meets an existing segment. `✓` means flow is continuous. `⚠ old #id` means an existing segment's direction forces a break. `⚠ user` means a hand-locked neighbour does.
+- Orientation comes only from adjacent existing segments or the traced order. When the two ends disagree, the stronger existing segment (higher lock, then higher road type) wins.
 
 ## Settings
 
-Settings are saved in `localStorage` under `wme-svra-settings`.
+Saved in your browser (`localStorage`, key `wme-svra-settings`).
 
-| Setting | Default | What it does |
-|---|---|---|
-| Min map zoom to scan | 16 | Auto-zooms to this level before scanning |
-| Zoom button level | 18 | Zoom level when you click the ⌖ button |
-| Detection radius (m) | 20 | How far from existing roads a cell is treated as "free" |
-| Min candidate length (m) | 30 | Shorter traces are discarded |
-| Max candidates stored | 1000 | Storage cap per session |
-| Sub-batch size | 10 | Drafts per internal batch during Convert |
-| Max drafts per click | 25 | Hard cap on how many drafts one Convert click can produce |
-| WME save-warning threshold | 250 | Warns when pending edits approach this count (never blocks) |
-| Auto-continue sub-batches | on | If on, one Convert click runs sub-batches up to the per-click cap |
-| Pause between batches (ms) | 2000 | WME settle time between sub-batches |
-| Delay between segments (ms) | 300 | Per-segment delay |
-| High-lock buffer (m) | 5 | Buffer around high-lock / protected segments |
-| Road type | Street | The road type assigned to converted drafts |
-| Split candidates at junctions | on | Splits traced candidates at existing-road crossings and skeleton forks |
-| Auto scan resolution | on | Picks the scan zoom automatically based on viewport size |
-| Tile budget per scan | 40 | Max coverage tiles fetched per scan |
-| Auto show/hide coverage with Street View | on | Toggles the green coverage layer with the Street View panel |
-| Responsibility acknowledgement | off | Must be checked once before Convert is enabled |
+| Setting | Default |
+|---|---|
+| Min map zoom to scan | 16 |
+| Zoom button level | 18 |
+| Detection radius (m) | 20 |
+| Min candidate length (m) | 30 |
+| Max candidates stored | 1000 |
+| Drafts per sub-batch | 10 |
+| Drafts per convert click (max 50) | 25 |
+| Remind me when unsaved edits reach (0 = never) | 300 |
+| Unverified-draft reminder, % of per-click cap (0 = off) | 150 |
+| Auto-continue sub-batches | on |
+| Pause between batches (ms) | 2000 |
+| Delay between segments (ms) | 300 |
+| Wait for map tiles before Convert (ms) | 1500 |
+| High-lock buffer (m) | 5 |
+| Road type | Street |
+| Split candidates at junctions | on |
+| Auto scan resolution | on |
+| Tile budget per scan | 40 |
+| Auto show/hide coverage with Street View | on |
+
+## Known limitations
+
+- Drafts are not aligned to any GPS data. Align them by hand.
+- Junction and seam flags rely on the mapped segments next to a candidate. Odd geometry can give a wrong dot or badge, so check each one.
+- The wait for map data is a heuristic. WME exposes no exact "tiles loaded" signal, so a draft can still be treated as a suggested edit on a slow connection. If that happens, raise "Wait for map tiles before Convert".
+- Large views are scanned in the centre area only, within the tile budget. Work in smaller views for full coverage.
+- Scanning again can join new pieces onto existing candidates or split them at junctions. Review after your last scan.
 
 ## About
 
-Written by **dinkaftac** ([GitHub: 9w2xne](https://github.com/9w2xne)). AI tools (Claude, DeepSeek) helped with code review, safety analysis, and documentation drafting. All design decisions, safety boundaries, and the final code were reviewed and approved by the human author. The script was smoke-tested against the full workflow — Scan, Convert, Flip, Undo — before this beta release.
-
-The author takes responsibility for the script's behaviour and is the point of contact for the Waze guidelines review.
-
-## Local rules first
-
-Before using this script, check with your local Waze community. Some communities restrict external reference sources (including Street View tiles) more strictly than the global guidelines. If your community says no, don't use it — even if the script works technically.
+Written by dinkaftac ([9w2xne](https://github.com/9w2xne)). AI tools helped with code review and documentation. The author made the design decisions and approved the code.
 
 ## Disclaimer
 
