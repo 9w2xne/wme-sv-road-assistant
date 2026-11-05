@@ -2,7 +2,7 @@
 // @name         WME Street View Road Assistant
 // @namespace    https://github.com/9w2xne/wme-sv-road-assistant
 // @version      1.0.0-beta
-// @description  Manual assistance for editors: the script proposes draft segments over Street View coverage gaps. Every draft must be reviewed by the editor, aligned to the road centerline, and confirmed against the latest satellite imagery before WME's native Save. Nothing is ever saved automatically, and no existing road is modified.
+// @description  Manual assistance for editors: the script proposes draft segments over Street View coverage gaps. Every draft must be reviewed by the editor, aligned to the road centerline, and confirmed against the latest satellite imagery before WME's native Save. Nothing is ever saved automatically, and no existing road is modified. Designed to follow the Waze Guidelines for Bulk Editing Scripts: the tool proposes, the editor decides.
 // @author       dinkaftac (https://github.com/9w2xne)
 // @license      MIT
 // @homepageURL  https://github.com/9w2xne/wme-sv-road-assistant
@@ -50,6 +50,7 @@
 
   const NEVER_CONNECT = [5, 10, 15, 16, 18, 19];
   const SAFE_PENDING_LIMIT = 30;
+  const FINAL_VIEW_PAUSE_MS = 2000;   // let the editor see the last draft before the view snaps back
   // How long an acknowledgement is remembered before the dialog can reappear.
   // Set to 3 days by default; users who want it longer can adjust.
   const RESPONSIBILITY_COOLDOWN_MS = 3 * 24 * 60 * 60 * 1000;
@@ -67,13 +68,15 @@
     maxCandidatesStorage: 1000,
     maxDraftCreationBatch: 10,
     maxConvertPerClick: 25,
-    maxPendingEdits: 250,
+    maxPendingEdits: 300,          // reminder threshold (0 = never remind)
+    unverifiedSoftStopPct: 150,    // reminder when unsaved script drafts reach this % of the per-click cap (0 = off)
     autoBatch: true,
     batchPauseMs: 2000,
     convertDelayMs: 300,
+    tileSettleMs: 1500,
     minScanZoom: 16,
     focusZoom: 18,
-    settingsRev: 15,
+    settingsRev: 16,
     highLockBuffer: 5,
     roadPreset: 'street',
     autoCoverage: true,
@@ -573,6 +576,30 @@
       }
       return out;
     },
+    // Which existing segment wins when two ends disagree: higher lock first, then higher road type.
+    strength(c) { return (c.lock || 0) * 100 + (c.roadType || 0); },
+
+    // Decide whether a candidate should be reversed so its ends meet the adjacent existing segments
+    // cleanly (A|B seams). Both orientations are scored by how many boundary constraints they satisfy;
+    // on a tie the orientation that honours the STRONGER existing segment wins. No compass rule:
+    // orientation comes only from adjacent segments or the traced order.
+    solve(coords, pool) {
+      const cons = this.boundary([{ coords }], pool);
+      if (!cons.length) return { flipped: false, cons, breaks: {} };
+      const evaluate = (flipped) => {
+        let n = 0, weight = 0;
+        const breaks = {};
+        for (const c of cons) {
+          const present = c.which === 'start' ? (flipped ? 'B' : 'A') : (flipped ? 'A' : 'B');
+          if (present === c.wantNode) { n++; weight += this.strength(c); } else breaks[c.which] = c;
+        }
+        return { n, weight, breaks };
+      };
+      const normal = evaluate(false), flip = evaluate(true);
+      const useFlip = flip.n > normal.n || (flip.n === normal.n && flip.weight > normal.weight);
+      return { flipped: useFlip, cons, breaks: (useFlip ? flip : normal).breaks };
+    },
+
     links(cand) {
       const reach = 3;
       const out = [];
@@ -595,7 +622,7 @@
         const saved = JSON.parse(localStorage.getItem('wme-svra-settings') || '{}');
         Object.assign(this.data, saved);
         if (saved.settingsRev !== DEFAULT_SETTINGS.settingsRev) {
-          ['minScanZoom', 'focusZoom', 'maxDraftCreationBatch', 'convertDelayMs', 'splitAtJunctions', 'settingsRev']
+          ['minScanZoom', 'focusZoom', 'maxDraftCreationBatch', 'convertDelayMs', 'splitAtJunctions', 'maxPendingEdits', 'settingsRev']
             .forEach((k) => { this.data[k] = DEFAULT_SETTINGS[k]; });
         }
         if (this.data.roadPreset === 'service') this.data.roadPreset = 'street';
@@ -657,7 +684,8 @@
     stale(ttlMs = 1500) { return !this.cache || (Date.now() - this.cacheAt) >= ttlMs; },
 
     async refresh(force = false) {
-      if (!force && this.cache && (Date.now() - this.cacheAt) < this.CACHE_TTL_MS) return;
+      // Only reuse a NON-EMPTY cache. An empty result (WME not loaded yet) must never be cached.
+      if (!force && this.cache && this.cache.length && (Date.now() - this.cacheAt) < this.CACHE_TTL_MS) return;
       if (this.refreshing) return this.refreshing;
       this.refreshing = (async () => {
         try {
@@ -916,7 +944,7 @@
       State.scanning = true; UI.setBusy(true, 'Scanning viewport...');
       const t0 = performance.now();
       try {
-        await WazeData.refresh();
+        await WazeData.refresh(true);
         let zoom = await MapUtil.zoom();
         if (zoom !== null && zoom < Settings.get('minScanZoom')) {
           const need = Settings.get('minScanZoom');
@@ -925,14 +953,14 @@
           Log.i(`auto-zoom from ${zoom} to ${need} to bring every street into view`);
           await MapUtil.focus([cx, cy], need);
           await sleep(800);
-          await WazeData.refresh();
+          await WazeData.refresh(true);
           zoom = await MapUtil.zoom();
           if (zoom !== null && zoom < need) {
             throw new Error(`Still at zoom ${zoom} (needed ${need}); WME refused to zoom. Zoom in manually and Scan again.`);
           }
         }
         let extent = await MapUtil.extent();
-        if (!WazeData.all().length) { await sleep(700); await WazeData.refresh(); }
+        if (!WazeData.all().length) { await sleep(700); await WazeData.refresh(true); }
         const inView = WazeData.inBox(extent).length;
         Log.i(`scan: ${WazeData.all().length} roads known to the script, ${inView} in view`);
         if (State.candidates.size) Candidates.pruneMapped();
@@ -1176,17 +1204,7 @@
           c.jStart = !!(c.jStart || pJm.jStart);
           c.jEnd = !!(c.jEnd || pJm.jEnd);
           // Re-stamp seams from boundary constraints against the new geometry.
-          const pool2 = WazeData.inBox(Geo.bboxPad(Geo.bbox(c.coords), ORIENT_REACH + 20));
-          c.seamStart = { state: 'clean' };
-          c.seamEnd = { state: 'clean' };
-          for (const b of Chain.boundary([c], pool2)) {
-            const terminalIsStart = b.which === 'start';
-            const point = terminalIsStart ? c.coords[0] : c.coords[c.coords.length - 1];
-            if (!this._nodeAt(c.coords, point, b.wantNode)) {
-              const seam = { state: 'break-old-locked', segId: b.segId, segDir: b.segDir };
-              if (terminalIsStart) c.seamStart = seam; else c.seamEnd = seam;
-            }
-          }
+          this.restampSeams(c);
           stats.merged++;
           return true;
         }
@@ -1197,24 +1215,10 @@
       let reversed = false;
       const reverse = () => { coords = coords.slice().reverse(); const t = os; os = oe; oe = t; reversed = !reversed; };
 
-      // Boundary orientation: try both orientations, pick the one that satisfies more
-      // constraints from adjacent existing segments. No compass rule (SDK has none).
+      // Boundary orientation: Chain.solve scores both orientations against the adjacent existing
+      // segments (stronger segment wins a tie). No compass rule (SDK has none).
       const pool = WazeData.inBox(Geo.bboxPad(Geo.bbox(coords), ORIENT_REACH + 20));
-      const tempPiece = { coords, origStart: os, origEnd: oe };
-      const boundary = Chain.boundary([tempPiece], pool);
-      if (boundary.length) {
-        const scoreOrientation = (oriented) => {
-          let n = 0;
-          for (const b of boundary) {
-            const point = b.which === 'start' ? oriented[0] : oriented[oriented.length - 1];
-            if (this._nodeAt(oriented, point, b.wantNode)) n++;
-          }
-          return n;
-        };
-        const normal = scoreOrientation(coords);
-        const flipped = scoreOrientation(coords.slice().reverse());
-        if (flipped > normal) reverse();
-      }
+      if (Chain.solve(coords, pool).flipped) reverse();
 
       Log.d(`candidate placed: ${reversed ? 'reversed' : 'as-traced'}, ${coords.length} nodes, ${Math.round(Geo.length(coords))} m`);
       const id = nextId('C');
@@ -1231,26 +1235,32 @@
         seamStart: { state: 'clean' },
         seamEnd: { state: 'clean' }
       };
-      const cons = Chain.boundary([c], pool);
-      for (const b of cons) {
-        const terminalIsStart = b.which === 'start';
-        const point = terminalIsStart ? coords[0] : coords[coords.length - 1];
-        if (!this._nodeAt(coords, point, b.wantNode)) {
-          const seam = { state: 'break-old-locked', segId: b.segId, segDir: b.segDir };
-          if (terminalIsStart) c.seamStart = seam; else c.seamEnd = seam;
-        }
-      }
+      this.restampSeams(c, pool);
       State.candidates.set(id, c);
       stats.added++;
       return true;
     },
-
+    // Recompute the seam badges of a candidate from the existing segments next to its two ends.
+    restampSeams(c, pool) {
+      const p = pool || WazeData.inBox(Geo.bboxPad(Geo.bbox(c.coords), ORIENT_REACH + 20));
+      c.seamStart = { state: 'clean' };
+      c.seamEnd = { state: 'clean' };
+      for (const b of Chain.boundary([c], p)) {
+        const terminalIsStart = b.which === 'start';
+        const point = terminalIsStart ? c.coords[0] : c.coords[c.coords.length - 1];
+        if (!this._nodeAt(c.coords, point, b.wantNode)) {
+          const seam = { state: 'break-old-locked', segId: b.segId, segDir: b.segDir };
+          if (terminalIsStart) c.seamStart = seam; else c.seamEnd = seam;
+        }
+      }
+    },
     _nodeAt(coords, point, wantNode) {
       const dFirst = Geo.haversine(point, coords[0]);
       const dLast = Geo.haversine(point, coords[coords.length - 1]);
       const present = dFirst <= dLast ? 'A' : 'B';
       return present === wantNode;
     },
+
 
     tryJoinJunctionAware(a, b, m, pJ, cJ) {
       const ea = [a[0], a[a.length - 1]], eb = [b[0], b[b.length - 1]];
@@ -1306,7 +1316,11 @@
       visited.add(c.id);
       c.coords = c.coords.slice().reverse();
       const t = c.origStart; c.origStart = c.origEnd; c.origEnd = t;
+      // The junction dot belongs to the physical end, so it moves to the other column with A/B.
+      const jt = c.jStart; c.jStart = !!c.jEnd; c.jEnd = !!jt;
       c.flowLocked = true;
+      // Seam badges depend on which end is A, so recompute them against the existing segments.
+      try { this.restampSeams(c); } catch (e) { Log.w('restamp after flip failed', e); }
 
       const links = Chain.links(c);
       for (const nb of links) {
@@ -1359,17 +1373,13 @@
 
   /* ===== GENERATED SEGMENTS ===== */
   async function getSeg(id) {
-    const cached = SEG_CACHE.get(id);
-    if (cached) return cached;
-    try {
-      let s = sdk.DataModel.Segments.getById({ segmentId: id });
-      if (isPromise(s)) s = await s;
-      if (s) {
-        SEG_CACHE.set(id, s);
-        if (SEG_CACHE.size > SEG_CACHE_MAX) SEG_CACHE.delete(SEG_CACHE.keys().next().value);
-      }
-      return s || null;
-    } catch (e) { return null; }
+    // Always read fresh: undo checks must see a deleted segment as gone, not a cached object.
+    try { let s = sdk.DataModel.Segments.getById({ segmentId: id }); if (isPromise(s)) s = await s; return s || null; }
+    catch (e) { return null; }
+  }
+  async function editCount() {
+    try { let n = sdk.Editing.getUnsavedChangesCount(); if (isPromise(n)) n = await n; return typeof n === 'number' ? n : null; }
+    catch (e) { return null; }
   }
 
   const Generated = {
@@ -1443,31 +1453,95 @@
       return Math.max(own, wme === null ? 0 : wme);
     },
 
+    // Nearest-first order: candidates already inside the starting view first, then by distance from
+    // the starting view centre. Candidates skipped in this run are left out.
+    _orderPicked(list, run) {
+      const rest = list.filter((c) => !(run.skipped && run.skipped.has(c.id)));
+      const ctr = run.savedCenter, ext = run.startExtent;
+      if (!ctr) return rest;
+      const onScreen = (c) => !!ext && this._ptsInside(this._probePoints(c.coords), ext);
+      const dist = (c) => { const b = Geo.bbox(c.coords); return Geo.haversine([(b[0] + b[2]) / 2, (b[1] + b[3]) / 2], [ctr.lon, ctr.lat]); };
+      return rest.map((c) => ({ c, v: onScreen(c) ? 0 : 1, d: dist(c) }))
+        .sort((x, y) => x.v - y.v || x.d - y.d).map((x) => x.c);
+    },
+
+    // Points that must be inside the loaded view for a candidate to be converted: both ends and the
+    // middle vertex. (A long candidate may be larger than the view, so the whole bbox is not required.)
+    _probePoints(coords) {
+      return [coords[0], coords[Math.floor(coords.length / 2)], coords[coords.length - 1]];
+    },
+    _ptsInside(pts, ext) {
+      if (!ext) return false;
+      const padLat = 10 / 110540;
+      return pts.every((p) => p[0] >= ext[0] && p[0] <= ext[2] && p[1] >= ext[1] + padLat && p[1] <= ext[3] - padLat);
+    },
+
+    // Wait until WME has really finished loading the map data around the batch. Creating a segment
+    // while the area's tiles are still loading makes WME treat it as a suggested edit and send it
+    // for review straight away, so Convert refuses to run until the data is loaded and steady.
+    async _confirmTilesLoaded(first, mult = 1) {
+      const settle = Math.min(20000, Math.max(500, Number(Settings.get('tileSettleMs')) || 1500) * mult);
+      const deadline = Date.now() + 20000 + settle * 6;
+      let probe = this._probePoints(first.coords);
+      let sawEvent = false, prev = -1, why = 'timed out';
+
+      // A candidate longer than the view cannot be shown whole. Visit each end first so WME loads
+      // the tiles there, then come back to the middle and require only the middle to be in view.
+      if (!this._ptsInside(probe, await MapUtil.extent())) {
+        const zoom = (await MapUtil.zoom()) || 16;
+        const fb = Geo.bbox(first.coords);
+        const centre = [(fb[0] + fb[2]) / 2, (fb[1] + fb[3]) / 2];
+        Log.i(`${first.id} is larger than the view: loading its ends first`);
+        for (const pt of [probe[0], probe[2], centre]) {
+          const loaded = MapLoad.wait({ timeoutMs: settle + 500, quietMs: settle });
+          await MapUtil.focus(pt, zoom);
+          if (await loaded) sawEvent = true;
+        }
+        await WazeData.refresh(true);
+        probe = [probe[1]];
+      }
+      while (Date.now() < deadline) {
+        const evt = await MapLoad.wait({ timeoutMs: settle + 500, quietMs: settle });
+        if (evt) sawEvent = true;
+        await WazeData.refresh(true);
+        const ext = await MapUtil.extent();
+        if (!this._ptsInside(probe, ext)) { prev = -1; why = 'the candidate is not inside the view'; continue; }
+        const n = WazeData.inBox(ext).length;
+        const known = WazeData.all().length;
+        // Ready = no new map-data event in the last window AND the road count in view did not change
+        // since the previous check. WME often fires no event when the map was already loaded, and a
+        // sparsely mapped area can legitimately have zero roads in view, so an empty view is accepted
+        // when WME has delivered road data at all (an event, or roads known elsewhere).
+        const steady = !evt && n === prev;
+        if (steady && (n > 0 || sawEvent || known > 0)) return { ok: true, roads: n, known };
+        why = steady ? 'WME has delivered no road data yet' : 'map data is still changing';
+        prev = n;
+      }
+      Log.w(`tile check failed for ${first.id}: ${why}`);
+      return { ok: false, why };
+    },
+
     async convertSelected(isContinuation = false) {
       if (this.busy || this._waiting) return;
 
       let picked = Candidates.selected();
       if (!picked.length) { UI.notify('Select candidate(s) first.', 'warn'); return; }
 
-      const limit = Math.max(1, Number(Settings.get('maxPendingEdits')) || SAFE_PENDING_LIMIT);
+      const remindAt = Math.max(0, Number(Settings.get('maxPendingEdits')) || 0);
 
       if (!isContinuation) {
         this._waiting = true;
         try {
-          await WazeData.refresh();
+          await WazeData.refresh(true);
           const removed = Candidates.pruneMapped();
           if (removed) { UI.notify(`${removed} candidate(s) removed.`, 'warn'); UI.changed(); }
           picked = Candidates.selected();
           if (!picked.length) return;
 
           const pending = await this.pendingCount();
-          if (pending >= limit) {
-            Log.w(`WME technical edit ceiling reached (${pending}/${limit}). Continuing; WME will prompt to Save.`);
-            UI.notify(`You already have ${pending} unsaved edits. WME may ask you to Save soon. Continuing with the proposal...`, 'warn');
-          }
 
           const per = Math.max(1, Settings.get('maxDraftCreationBatch'));
-          const perClickCap = Math.max(per, Number(Settings.get('maxConvertPerClick')) || per);
+          const perClickCap = Math.min(50, Math.max(per, Number(Settings.get('maxConvertPerClick')) || per));
           const autoBatch = Settings.get('autoBatch') !== false;
 
           const toConvert = autoBatch
@@ -1475,16 +1549,40 @@
             : Math.min(picked.length, per);
 
           const total = Math.ceil(toConvert / per);
-          const risk = limit > SAFE_PENDING_LIMIT && pending + toConvert > SAFE_PENDING_LIMIT;
+          const risk = remindAt > 0 && pending + toConvert >= remindAt;
+
+          // Friendly checkpoints: they advise the editor and never block the conversion.
+          const notes = [];
+          if (picked.length > perClickCap) {
+            notes.push(`You ticked ${picked.length}; the cap is ${perClickCap}. This click will attempt ${perClickCap}. ${picked.length - perClickCap} stay ticked for the next pass.`);
+          }
+          if (remindAt > 0) {
+            if (pending >= remindAt) {
+              if (!this._remindFired) {
+                notes.push(`You have ${pending} unsaved edits in WME (your reminder is set at ${remindAt}; script default 300). Finish aligning, connecting and saving the current drafts before adding more, so no work is lost. This is only a reminder; Convert continues.`);
+                this._remindFired = true;
+              }
+            } else this._remindFired = false;
+          }
+          const pct = Math.max(0, Number(Settings.get('unverifiedSoftStopPct')) || 0);
+          if (pct > 0) {
+            const unverified = [...State.generated.values()]
+              .filter((g) => g.segmentIds && g.segmentIds.length && g.status !== 'Saved' && g.status !== 'Undone' && g.status !== 'Error').length;
+            const thr = Math.ceil(perClickCap * pct / 100);
+            if (unverified >= thr) {
+              if (!this._unverFired) {
+                notes.push(`${unverified} drafts from this script are still unsaved (reminder at ${pct}% of the per-click cap = ${thr}; script default 150%). Align and verify them, then Save, before converting more. This is only a reminder; Convert continues.`);
+                this._unverFired = true;
+              }
+            } else this._unverFired = false;
+          }
+          if (notes.length) UI.checkpoint(notes);
           const acked = !!Settings.get('responsibilityAcknowledged');
           const needsDialog = !acked;
-          if (!needsDialog && risk) {
-            UI.notify(`Heads up: you have ${pending} unsaved edits. WME may ask you to save soon.`, 'warn');
-          }
           if (needsDialog) {
             const preset = PRESETS.find((p) => p.key === Settings.get('roadPreset')) || PRESETS[0];
             const go = await UI.confirmConvert({
-              count: toConvert, ticked: picked.length, per, total, roadLabel: preset.label, limit, risk, acked,
+              count: toConvert, ticked: picked.length, per, total, roadLabel: preset.label, limit: remindAt, risk, acked,
               autoBatch
             });
             if (!go) { UI.notify('Conversion cancelled. Nothing was created.', 'info'); return; }
@@ -1495,13 +1593,18 @@
             clickBudget: toConvert,
             convertedThisClick: 0,
             savedCenter: await MapUtil.centerNow(),
-            savedZoom: await MapUtil.zoom()
+            savedZoom: await MapUtil.zoom(),
+            startExtent: await MapUtil.extent(),
+            skipped: new Set()
           };
         } finally { this._waiting = false; }
       }
-      if (!this._run) this._run = { total: 1, n: 0, savedCenter: null, savedZoom: null };
+      if (!this._run) this._run = { total: 1, n: 0, savedCenter: null, savedZoom: null, skipped: new Set() };
       const run = this._run;
       run.n++;
+      if (!run.skipped) run.skipped = new Set();
+      // Nearest-first: candidates already on screen come first, then by distance from the starting view.
+      picked = this._orderPicked(picked, run);
 
       const per = Math.max(1, Settings.get('maxDraftCreationBatch'));
       let batch;
@@ -1520,23 +1623,80 @@
         this._run = null;
       };
 
-      if (!batch.length) { await restoreView(); return; }
+      const viewMoved = async () => {
+        if (!run.savedCenter) return false;
+        const c = await MapUtil.centerNow(); const z = await MapUtil.zoom();
+        if (!c) return true;
+        return Geo.haversine([c.lon, c.lat], [run.savedCenter.lon, run.savedCenter.lat]) > 20 || (!!run.savedZoom && z !== run.savedZoom);
+      };
+      const skippedNote = () => (run.skipped.size
+        ? ` ${run.skipped.size} skipped because WME had not finished loading the map around them (${[...run.skipped].join(', ')}); they stay ticked, so press Convert again.`
+        : '');
+      const finishNow = async (lead) => {
+        if (await viewMoved()) {
+          UI.setBusy(true, 'Returning to your starting view in 2 s...');
+          await sleep(FINAL_VIEW_PAUSE_MS);
+        }
+        UI.setBusy(true, 'Restoring map view...');
+        await restoreView();
+        UI.setBusy(false);
+        UI.notify(`${lead}${skippedNote()} Map view restored. Review each draft, align to the road centerline / satellite imagery, then press WME's Save. Nothing has been saved yet.`, run.skipped.size ? 'warn' : 'ok');
+        UI.changed();
+      };
+      // Never abort the whole click for one candidate: skip it (it stays ticked) and carry on.
+      const skipAndContinue = async (cand, why) => {
+        run.skipped.add(cand.id);
+        Log.w(`skipping ${cand.id}: ${why}`);
+        UI.setBusy(false);
+        const left = Candidates.selected().filter((x) => !run.skipped.has(x.id)).length;
+        const budgetLeft = (run.clickBudget ?? Infinity) - (run.convertedThisClick ?? 0);
+        if (left > 0 && budgetLeft > 0) return this.convertSelected(true);
+        return finishNow(`${this._runCreated || 0} draft segment(s) created.`);
+      };
+
+      if (!batch.length) { await finishNow(`${this._runCreated || 0} draft segment(s) created.`); return; }
 
       const firstCand = batch[0];
-      const centerCoord = firstCand.coords[Math.floor(firstCand.coords.length / 2)];
+      const fb = Geo.bbox(firstCand.coords);
+      const centerCoord = [(fb[0] + fb[2]) / 2, (fb[1] + fb[3]) / 2];
       let pan;
       this._waiting = true;
       try {
-        UI.setBusy(true, `Panning to ${firstCand.id} (Batch ${run.n}/${run.total})...`);
-        pan = await this._panTo(centerCoord, 16);
+        // A candidate that is already on screen is converted without moving the map.
+        const ext0 = await MapUtil.extent();
+        const z0 = await MapUtil.zoom();
+        if (z0 !== null && z0 >= 16 && this._ptsInside(this._probePoints(firstCand.coords), ext0)) {
+          pan = { ok: true, dist: 0, stayed: true };
+        } else {
+          UI.setBusy(true, `Panning to ${firstCand.id} (Batch ${run.n}/${run.total})...`);
+          pan = await this._panTo(centerCoord, 16);
+        }
       } finally { this._waiting = false; }
+      if (!pan.ok) return skipAndContinue(firstCand, `the map did not centre on it (off by ${Math.round(pan.dist)} m)`);
 
-      if (!pan.ok) {
-        UI.setBusy(false);
-        await restoreView();
-        UI.notify(`Batch ${run.n}/${run.total} stopped: the map did not centre on ${firstCand.id} (off by ${Math.round(pan.dist)} m), so nothing was created in this batch. ${this._runCreated || 0} segment(s) were created earlier in this run. Map view restored.`, 'err');
-        UI.changed();
-        return;
+      // Do not create anything until WME has finished loading the tiles for this area.
+      let tiles;
+      this._waiting = true;
+      try {
+        UI.setBusy(true, `Batch ${run.n}/${run.total}: waiting for map tiles to finish loading...`);
+        tiles = await this._confirmTilesLoaded(firstCand);
+        if (!tiles.ok) {
+          UI.setBusy(true, `Batch ${run.n}/${run.total}: tiles still loading, waiting longer...`);
+          tiles = await this._confirmTilesLoaded(firstCand, 2);
+        }
+      } finally { this._waiting = false; }
+      if (!tiles.ok) return skipAndContinue(firstCand, `tiles not confirmed (${tiles.why})`);
+      Log.i(`tiles confirmed loaded (${tiles.roads} roads in view)`);
+      {
+        // Only convert candidates that sit fully inside the view that was just confirmed. The rest
+        // stay ticked and are handled by the next batch, after the map pans to them.
+        const ext = await MapUtil.extent();
+        const fits = (c) => this._ptsInside(this._probePoints(c.coords), ext);
+        const keep = batch.filter((c, i) => i === 0 || fits(c));
+        if (keep.length && keep.length < batch.length) {
+          Log.i(`batch trimmed to ${keep.length}/${batch.length} candidates inside the loaded view`);
+          batch = keep;
+        }
       }
 
       const rt = Settings.roadTypeFor(Settings.get('roadPreset'));
@@ -1548,11 +1708,7 @@
           const before = await editCount();
           const pendingNow = await this.pendingCount();
 
-          if (pendingNow >= limit && bi === 0) {
-            UI.setBusy(true, `Batch ${run.n}/${run.total}: converting ${c.id}, pending ${pendingNow}/${limit} (WME may need a Save soon)...`);
-          } else {
-            UI.setBusy(true, `Batch ${run.n}/${run.total}: converting ${c.id} (${bi + 1}/${batch.length}), pending ${pendingNow}/${limit}...`);
-          }
+          UI.setBusy(true, `Batch ${run.n}/${run.total}: converting ${c.id} (${bi + 1}/${batch.length}), unsaved edits ${pendingNow}...`);
 
           const coords = shapeLine(c.coords, traceOpts());
           let segmentId;
@@ -1596,7 +1752,7 @@
       await this.validate();
       this._runCreated = (this._runCreated || 0) + created;
 
-      const remainingCount = Candidates.selected().length;
+      const remainingCount = Candidates.selected().filter((x) => !run.skipped.has(x.id)).length;
       const budgetRemaining = (run.clickBudget ?? Infinity) - (run.convertedThisClick ?? 0);
       const more = remainingCount > 0
         && !stoppedAt && !failed && !hitLimit
@@ -1626,11 +1782,15 @@
         return this.convertSelected(true);
       }
 
+      if (await viewMoved()) {
+        UI.setBusy(true, 'Last draft created. Returning to your starting view in 2 s...');
+        await sleep(FINAL_VIEW_PAUSE_MS);
+      }
       UI.setBusy(true, 'Restoring map view...');
       await restoreView();
       await sleep(300);
       UI.setBusy(false);
-      UI.notify(`${message} Map view restored. Review each draft, align to the road centerline / satellite imagery, then press WME's Save. Nothing has been saved yet.`, (failed || remainingCount > 0 || hitLimit) ? 'warn' : 'ok');
+      UI.notify(`${message}${skippedNote()} Map view restored. Review each draft, align to the road centerline / satellite imagery, then press WME's Save. Nothing has been saved yet.`, (failed || remainingCount > 0 || hitLimit || run.skipped.size) ? 'warn' : 'ok');
       UI.changed();
     },
     async remove(rows) {
@@ -1852,6 +2012,12 @@
         .svra .seam.old{background:var(--svra-seam-old)}
         .svra .seam.user{background:var(--svra-seam-user)}
         .svra .jdot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--svra-jdot);margin:0 1px;vertical-align:middle}
+        .svra .checkpoint{position:relative;margin:4px 0 6px;padding:5px 24px 5px 7px;border:1px solid #f9a825;border-radius:4px;background:rgba(249,168,37,.14);font-size:12px}
+        .svra .checkpoint .x{position:absolute;top:2px;right:2px;padding:0 5px;min-width:0;line-height:16px}
+        .svra .checkpoint div{margin-top:3px}
+        .svra details.notes{margin:4px 0 6px;border:1px solid var(--svra-border-soft);border-radius:4px;padding:3px 6px}
+        .svra details.notes summary{cursor:pointer;font-weight:600;font-size:12px;color:var(--svra-fg)}
+        .svra details.notes[open] summary{margin-bottom:4px}
         .svra .notice{margin:4px 0 6px;padding:5px 8px;border-left:3px solid var(--svra-tag-warn);border-radius:3px;background:var(--svra-msg-warn-bg);color:var(--svra-fg);font-size:11px}
         .svra-overlay{position:fixed;inset:0;z-index:100000;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,.5)}
         .svra.svra-modal{box-sizing:border-box;width:min(480px,100%);max-height:90vh;overflow:auto;padding:18px 20px 16px;border:1px solid var(--svra-border);border-radius:10px;box-shadow:0 12px 36px rgba(0,0,0,.4);font-size:13px;line-height:1.45}
@@ -2098,6 +2264,18 @@
       return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     },
 
+    // Friendly checkpoint: advises the editor, never blocks anything. Dismiss with the x.
+    checkpoint(msgs) {
+      const list = (Array.isArray(msgs) ? msgs : [msgs]).filter(Boolean);
+      if (!list.length) return;
+      this._checkpoint = list;
+      list.forEach((m) => Log.i(`Reminder: ${m}`));
+      this.refresh();
+    },
+    _checkpointHtml() {
+      if (!this._checkpoint || !this._checkpoint.length) return '';
+      return `<div class="checkpoint"><button data-action="checkpoint-close" class="x" title="Dismiss">&#10005;</button><b>Friendly reminder</b> (never stops Convert)${this._checkpoint.map((m) => `<div>${this._esc(m)}</div>`).join('')}</div>`;
+    },
     _seamBadge(seam, endLabel) {
       if (!seam) return '';
       if (seam.state === 'break-old-locked') {
@@ -2119,6 +2297,8 @@
       // Keep the Settings drawer open and the scroll position across the full re-render.
       const prevDet = this.pane.querySelector('details.more');
       if (prevDet) this._settingsOpen = prevDet.open;
+      const prevNotes = this.pane.querySelector('details.notes');
+      if (prevNotes) this._notesOpen = prevNotes.open;
       const scroller = this._scrollParent();
       const prevTop = scroller ? scroller.scrollTop : 0;
       const s = Settings.data;
@@ -2171,10 +2351,13 @@
           <button class="primary wide" data-action="convert" ${off || (selC ? '' : 'disabled')} title="Turn the ticked candidates into editable WME segments. Repeat as needed — the script only warns near WME's technical limit; Save clears it.">Convert${selC ? ` (${selC})` : ''}</button>
           <button class="danger" data-action="remove-sel" ${off || (nSel ? '' : 'disabled')} title="Remove everything ticked below">Remove${nSel ? ` (${nSel})` : ''}</button>
         </div>
-        <div class="sub" style="margin-bottom:4px">Draft proposal tool for manual editing. No automatic writes; no modification of existing map data.</div>
+        <div class="sub" style="margin-bottom:4px">Draft proposal tool for manual editing. No automatic writes; no modification of existing map data. Designed to follow the Waze Guidelines for Bulk Editing Scripts: the tool proposes, the editor decides.</div>
+        ${this._checkpointHtml()}
+        <details class="notes"><summary>Manual review only</summary>
         <div class="notice"><b>Manual review only.</b> The script proposes draft segments; <b>you</b> decide what to keep, correct, and save. It is not an automated editor.</div>
         <div class="notice"><b>Before you press Save.</b> For every draft: align it to the <b>real road centerline</b>, then <b>verify its shape against the latest satellite imagery</b>. The geometry comes from a traced Street View coverage gap and is <i>not</i> final. Only WME's native <b>Save</b> commits it.</div>
         <div class="notice"><b>What the script never does.</b> It never saves, never edits existing segments, junctions, or turn restrictions, and never connects a draft to a road. Every draft stays pending until <b>you</b> press Save, and every draft can be undone with <b>Remove</b> or <b>Ctrl+Z</b> in WME.</div>
+        </details>
         <div class="top">
           <button class="${Coverage.visible ? 'on' : ''}" data-action="cov-toggle" title="Street View coverage layer: green = ON, grey = OFF">Street View</button>
           <button class="${s.showGuide ? 'on' : ''}" data-action="guide-toggle" title="Orange scan-area frame: green = ON, grey = OFF">Guide</button>
@@ -2206,12 +2389,14 @@
           <label>Detection radius (m) <input type="number" min="3" max="200" data-setting="detectionRadius" value="${s.detectionRadius}"></label>
           <label>Min candidate length (m) <input type="number" min="10" max="500" data-setting="minCandidateLength" value="${s.minCandidateLength}"></label>
           <label>Max candidates stored <input type="number" min="10" max="5000" data-setting="maxCandidatesStorage" value="${s.maxCandidatesStorage}"></label>
-          <label>Sub-batch size (drafts per pass) <input type="number" min="1" max="500" data-setting="maxDraftCreationBatch" value="${s.maxDraftCreationBatch}"></label>
-          <label>Max drafts per click <input type="number" min="1" max="500" data-setting="maxConvertPerClick" value="${s.maxConvertPerClick}"></label>
-          <label>WME save-warning threshold (never blocks) <input type="number" min="50" max="500" data-setting="maxPendingEdits" value="${s.maxPendingEdits}"></label>
+          <label>Drafts per sub-batch (continues silently after you accept the notice) <input type="number" min="1" max="50" data-setting="maxDraftCreationBatch" value="${s.maxDraftCreationBatch}"></label>
+          <label>Drafts per convert click (max 50) <input type="number" min="1" max="50" data-setting="maxConvertPerClick" value="${s.maxConvertPerClick}"></label>
+          <label>Remind me when unsaved edits reach (script default 300; 0 = never) <input type="number" min="0" max="1000" data-setting="maxPendingEdits" value="${s.maxPendingEdits}"></label>
+          <label>Unverified-draft reminder at % of the per-click cap (script default 150; 0 = off) <input type="number" min="0" max="500" data-setting="unverifiedSoftStopPct" value="${s.unverifiedSoftStopPct}"></label>
           <label><input type="checkbox" data-setting="autoBatch" ${s.autoBatch !== false ? 'checked' : ''}> Auto-continue sub-batches until the per-click cap is reached (still manual review)</label>
           <label>Pause between batches (ms) <input type="number" min="0" max="20000" step="100" data-setting="batchPauseMs" value="${s.batchPauseMs}"></label>
           <label>Delay between segments (ms) <input type="number" min="0" max="5000" data-setting="convertDelayMs" value="${s.convertDelayMs}"></label>
+          <label>Wait for map tiles before Convert (ms) <input type="number" min="500" max="10000" step="100" data-setting="tileSettleMs" value="${s.tileSettleMs}"></label>
           <label>High-lock buffer (m) <input type="number" min="0" max="100" data-setting="highLockBuffer" value="${s.highLockBuffer}"></label>
           <label>Road type <select data-setting="roadPreset">${PRESETS.map((p) => `<option value="${p.key}" ${p.key === s.roadPreset ? 'selected' : ''}>${p.label}</option>`).join('')}</select></label>
           <label><input type="checkbox" data-setting="splitAtJunctions" ${s.splitAtJunctions ? 'checked' : ''}> Split candidates at junctions (recommended)</label>
@@ -2232,6 +2417,8 @@
         </details>`;
       const newDet = this.pane.querySelector('details.more');
       if (newDet && this._settingsOpen) newDet.open = true;
+      const newNotes = this.pane.querySelector('details.notes');
+      if (newNotes && this._notesOpen) newNotes.open = true;
       if (scroller) scroller.scrollTop = prevTop;
       const zoomEl = this.pane.querySelector('#svra-zoom');
       if (zoomEl) this.paintZoom(zoomEl);
@@ -2249,6 +2436,7 @@
           case 'remove-sel': this.removeSelected().catch((e2) => Log.e('remove', e2)); break;
           case 'cov-toggle': Coverage.toggle(); this.refresh(); break;
           case 'guide-toggle': Settings.set('showGuide', !Settings.get('showGuide')); this.updateGuide(); this.refresh(); break;
+          case 'checkpoint-close': this._checkpoint = null; this.refresh(); break;
           case 'flip-cand': { const c = State.candidates.get(id); if (c) { Candidates.flip(c); this.changed(); } break; }
           case 'oneway-cand': { const c = State.candidates.get(id); if (c) { Candidates.toggleOneWay(c); this.changed(); } break; }
           case 'flip-sel': {
@@ -2281,13 +2469,13 @@
       if (t.dataset.selectall === 'gen') { Generated.visible().forEach((g) => { g.selected = !!t.checked; }); this.changed(); return; }
       const key = t.dataset.setting;
       if (!key) return;
-      const NUMERIC_SETTINGS = new Set(['detectionRadius', 'minCandidateLength', 'maxCandidatesStorage', 'maxDraftCreationBatch', 'maxConvertPerClick', 'maxPendingEdits', 'batchPauseMs', 'convertDelayMs', 'minScanZoom', 'focusZoom', 'highLockBuffer', 'sampleZoom', 'cellPx', 'maxSampleTiles']);
+      const NUMERIC_SETTINGS = new Set(['detectionRadius', 'minCandidateLength', 'maxCandidatesStorage', 'maxDraftCreationBatch', 'maxConvertPerClick', 'maxPendingEdits', 'unverifiedSoftStopPct', 'batchPauseMs', 'convertDelayMs', 'tileSettleMs', 'minScanZoom', 'focusZoom', 'highLockBuffer', 'sampleZoom', 'cellPx', 'maxSampleTiles']);
       const CLAMPS = {
         minScanZoom: [10, 22], focusZoom: [10, 22], detectionRadius: [3, 200],
         minCandidateLength: [10, 500], maxCandidatesStorage: [10, 5000],
-        maxDraftCreationBatch: [1, 500], maxConvertPerClick: [1, 500],
-        maxPendingEdits: [50, 500], batchPauseMs: [0, 20000],
-        convertDelayMs: [0, 5000], highLockBuffer: [0, 100],
+        maxDraftCreationBatch: [1, 50], maxConvertPerClick: [1, 50], unverifiedSoftStopPct: [0, 500],
+        maxPendingEdits: [0, 1000], batchPauseMs: [0, 20000],
+        convertDelayMs: [0, 5000], tileSettleMs: [500, 10000], highLockBuffer: [0, 100],
         sampleZoom: [16, 20], cellPx: [1, 4], maxSampleTiles: [4, 400]
       };
       let val;
@@ -2460,7 +2648,7 @@
 
       UI.changed();
       W.__SVRA__ = { State, Settings, Geo, Junctions, Chain, Candidates, Generated, Coverage };
-      Log.i('Initialised v1.0.0-beta');
+      Log.i('Initialised v1.0.0-beta (build 2026-11-05-d: spec pass)');
     } catch (err) {
       Log.e('Initialisation failed', err);
     }
