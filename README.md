@@ -23,7 +23,7 @@ Built to assist a human editor, not to mass-edit: **the tool proposes, the edito
 
 The script requests Street View coverage tiles from `mts*.google.com` and **derives candidate line shapes from the coverage pixels**. The shapes are only a starting guess, and they can be offset, cut short, or wrong.
 
-- Treat every draft as unverified. Align it to the real road centerline using satellite imagery or other sources you are allowed to use, then verify it before saving.
+- Treat every draft as unverified. Align it to the real road centerline using satellite imagery, GPS points or other sources you are allowed to use, then verify it before saving.
 - Do not rely on the draft geometry as it is.
 - The tile endpoint is unofficial and may change or stop working without notice.
 - Check your local Waze community's rules on external reference sources before using or sharing this script.
