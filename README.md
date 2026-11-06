@@ -4,7 +4,7 @@ A manual-assistance userscript for the Waze Map Editor (WME). It proposes **draf
 
 > **Status: 1.0.0 beta.** Not audited by the Waze editing community. Use at your own risk.
 
-Designed to follow the Waze Guidelines for Bulk Editing Scripts: **the tool proposes, the editor decides.**
+Built to assist a human editor, not to mass-edit: **the tool proposes, the editor decides.** It is not an automated editor, and it is not endorsed or approved by Waze. Before using it, read the official [Guidelines for Bulk Editing Scripts](https://www.waze.com/discuss/t/guidelines-for-bulk-editing-scripts/407412) and your local community's rules.
 
 ## What it does
 
@@ -53,8 +53,9 @@ The script is not on Greasyfork, so updates are manual. When replacing the code 
 
 - **Nearest first.** Candidates already on screen are converted first, without moving the map. The rest follow, nearest to your starting view first.
 - **Sub-batches.** A click is processed in silent sub-batches (10 drafts by default) until the per-click cap is reached. This keeps WME's data loading ahead of the conversion.
-- **Waits for the map to load.** Before creating drafts in an area, the script waits until WME has finished loading the map there. Creating a segment before that can turn it into a suggested edit sent for review. A candidate longer than the view is handled by visiting both ends first.
+- **Waits for the map to load.** Before creating drafts in an area, the script waits until the candidate is inside the view and WME has sent no map-data update for the "Wait for map tiles" time (an empty area is fine). Creating a segment before that can turn it into a suggested edit sent for review. A candidate longer than the view is handled by visiting both ends first.
 - **Never stops early.** If the tiles around one candidate are not confirmed after a second, longer wait, that candidate is skipped and stays ticked. The rest of the click carries on, and the final message names the skipped candidates so you can press Convert again.
+- **Checks WME kept the drafts.** After each sub-batch the script confirms every draft still exists. If WME silently dropped one ("That change isn't allowed at this time"), the candidate returns to the list, unticked, tagged "WME rejected this draft". One refused draft never stops the rest.
 - **Returns to where you were.** After the last draft the script pauses for 2 seconds so you can see it, then snaps the map back to your starting view.
 
 ### After conversion
@@ -65,7 +66,7 @@ The script is not on Greasyfork, so updates are manual. When replacing the code 
 
 ### Undo
 
-Use **Remove** on a converted draft, or Ctrl+Z in WME while the drafts are still unsaved. Remove undoes drafts newest-first and refuses if other edits were made after them, so nothing else is lost.
+Use **Remove** on a converted draft, or Ctrl+Z in WME while the drafts are still unsaved. Ctrl+Z in the panel undoes a flip or 1W/2W change first, then clears ticks when WME has nothing left to undo. Remove undoes drafts newest-first and refuses if other edits were made after them, so nothing else is lost.
 
 ## Reminders (never blocking)
 
@@ -109,7 +110,6 @@ Saved in your browser (`localStorage`, key `wme-svra-settings`).
 | Drafts per convert click (max 50) | 25 |
 | Remind me when unsaved edits reach (0 = never) | 300 |
 | Unverified-draft reminder, % of per-click cap (0 = off) | 150 |
-| Auto-continue sub-batches | on |
 | Pause between batches (ms) | 2000 |
 | Delay between segments (ms) | 300 |
 | Wait for map tiles before Convert (ms) | 1500 |
@@ -127,6 +127,13 @@ Saved in your browser (`localStorage`, key `wme-svra-settings`).
 - The wait for map data is a heuristic. WME exposes no exact "tiles loaded" signal, so a draft can still be treated as a suggested edit on a slow connection. If that happens, raise "Wait for map tiles before Convert".
 - Large views are scanned in the centre area only, within the tile budget. Work in smaller views for full coverage.
 - Scanning again can join new pieces onto existing candidates or split them at junctions. Review after your last scan.
+
+## Compliance and accountability
+
+- **Transparent.** The full source is public in this repository. Nothing is obfuscated or loaded from elsewhere, apart from the Street View coverage tiles described above.
+- **Not for points.** The script exists to help editors map roads that are missing. It is not meant to raise edit counts. Every draft needs your own review and alignment, nothing is saved for you, and each Convert click is capped (script default 25, maximum 50).
+- **Local knowledge comes first.** Bulk tools do not replace it. If anything the script proposes, such as road type, direction or geometry, conflicts with your local community's standards, follow the community and involve it in the decision.
+- **Not approved by Waze.** This script has not been reviewed or endorsed by Waze or the editing community. Read the official [Guidelines for Bulk Editing Scripts](https://www.waze.com/discuss/t/guidelines-for-bulk-editing-scripts/407412) and ask your local community before using or sharing it.
 
 ## About
 
