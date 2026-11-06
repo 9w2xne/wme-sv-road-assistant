@@ -23,7 +23,7 @@ Built to assist a human editor, not to mass-edit: **the tool proposes, the edito
 
 The script requests Street View coverage tiles from `mts*.google.com` and **derives candidate line shapes from the coverage pixels**. The shapes are only a starting guess, and they can be offset, cut short, or wrong.
 
-- Treat every draft as unverified. Align it to the real road centerline using satellite imagery, GPS points or other sources you are allowed to use, then verify it before saving.
+- Treat every draft as unverified. Align it to the real road centerline using satellite imagery or other sources you are allowed to use, then verify it before saving.
 - Do not rely on the draft geometry as it is.
 - The tile endpoint is unofficial and may change or stop working without notice.
 - Check your local Waze community's rules on external reference sources before using or sharing this script.
@@ -52,7 +52,7 @@ The script is not on Greasyfork, so updates are manual. When replacing the code 
 ### How Convert works
 
 - **Nearest first.** Candidates already on screen are converted first, without moving the map. The rest follow, nearest to your starting view first.
-- **Sub-batches.** A click is processed in silent sub-batches (10 drafts by default) until the per-click cap is reached. This keeps WME's data loading ahead of the conversion.
+- **Sub-batches.** A click is processed in silent sub-batches (1 draft by default) until the per-click cap is reached. This keeps WME's data loading ahead of the conversion.
 - **Waits for the map to load.** Before creating drafts in an area, the script waits until the candidate is inside the view and WME has sent no map-data update for the "Wait for map tiles" time (an empty area is fine). Creating a segment before that can turn it into a suggested edit sent for review. A candidate longer than the view is handled by visiting both ends first.
 - **Never stops early.** If the tiles around one candidate are not confirmed after a second, longer wait, that candidate is skipped and stays ticked. The rest of the click carries on, and the final message names the skipped candidates so you can press Convert again.
 - **Checks WME kept the drafts.** After each sub-batch the script confirms every draft still exists. If WME silently dropped one ("That change isn't allowed at this time"), the candidate returns to the list, unticked, tagged "WME rejected this draft". One refused draft never stops the rest.
@@ -106,8 +106,9 @@ Saved in your browser (`localStorage`, key `wme-svra-settings`).
 | Detection radius (m) | 20 |
 | Min candidate length (m) | 30 |
 | Max candidates stored | 1000 |
-| Drafts per sub-batch | 10 |
-| Drafts per convert click (max 50) | 25 |
+| Drafts per sub-batch | 1 |
+| Drafts per convert click (max 50) | 10 |
+| Zoom level when panning to convert (12-18) | 14 |
 | Remind me when unsaved edits reach (0 = never) | 300 |
 | Unverified-draft reminder, % of per-click cap (0 = off) | 150 |
 | Pause between batches (ms) | 2000 |
@@ -131,7 +132,7 @@ Saved in your browser (`localStorage`, key `wme-svra-settings`).
 ## Compliance and accountability
 
 - **Transparent.** The full source is public in this repository. Nothing is obfuscated or loaded from elsewhere, apart from the Street View coverage tiles described above.
-- **Not for points.** The script exists to help editors map roads that are missing. It is not meant to raise edit counts. Every draft needs your own review and alignment, nothing is saved for you, and each Convert click is capped (script default 25, maximum 50).
+- **Not for points.** The script exists to help editors map roads that are missing. It is not meant to raise edit counts. Every draft needs your own review and alignment, nothing is saved for you, and each Convert click is capped (script default 10, maximum 50).
 - **Local knowledge comes first.** Bulk tools do not replace it. If anything the script proposes, such as road type, direction or geometry, conflicts with your local community's standards, follow the community and involve it in the decision.
 - **Not approved by Waze.** This script has not been reviewed or endorsed by Waze or the editing community. Read the official [Guidelines for Bulk Editing Scripts](https://www.waze.com/discuss/t/guidelines-for-bulk-editing-scripts/407412) and ask your local community before using or sharing it.
 
