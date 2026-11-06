@@ -2,7 +2,7 @@
 // @name         WME Street View Road Assistant
 // @namespace    https://github.com/9w2xne/wme-sv-road-assistant
 // @version      1.0.0-beta
-// @description  Manual assistance for editors: the script proposes draft segments over Street View coverage gaps. Every draft must be reviewed by the editor, aligned to the road centerline, and confirmed against the latest satellite imagery before WME's native Save. Nothing is ever saved automatically, and no existing road is modified. Designed to follow the Waze Guidelines for Bulk Editing Scripts: the tool proposes, the editor decides.
+// @description  Manual assistance for editors: the script proposes draft segments over Street View coverage gaps. Every draft must be reviewed by the editor, aligned to the road centerline, and confirmed against the latest satellite imagery before WME's native Save. Nothing is ever saved automatically, and no existing road is modified. Built to assist a human editor, not to mass-edit: the tool proposes, the editor decides.
 // @author       dinkaftac (https://github.com/9w2xne)
 // @license      MIT
 // @homepageURL  https://github.com/9w2xne/wme-sv-road-assistant
@@ -66,8 +66,8 @@
     detectionRadius: 20,
     minCandidateLength: 30,
     maxCandidatesStorage: 1000,
-    maxDraftCreationBatch: 10,
-    maxConvertPerClick: 25,
+    maxDraftCreationBatch: 1,      // author-recommended: one draft per sub-batch, each checked against loaded tiles
+    maxConvertPerClick: 10,
     maxPendingEdits: 300,          // reminder threshold (0 = never remind)
     unverifiedSoftStopPct: 150,    // reminder when unsaved script drafts reach this % of the per-click cap (0 = off)
     batchPauseMs: 2000,
@@ -951,13 +951,38 @@
           const ext0 = await MapUtil.extent();
           const cx = (ext0[0] + ext0[2]) / 2, cy = (ext0[1] + ext0[3]) / 2;
           Log.i(`auto-zoom from ${zoom} to ${need} to bring every street into view`);
+          // WME loads the editable segments only at zoom 16+, and sends its "map data loaded" event a few
+          // seconds after the zoom. Wait for that event (not just a fixed delay) before reading the roads.
+          UI.setBusy(true, 'Zooming in and waiting for WME to load the roads...');
+          const loadedAfterZoom = MapLoad.wait({ timeoutMs: 8000, quietMs: 900 });
           await MapUtil.focus([cx, cy], need);
-          await sleep(800);
+          if (!(await loadedAfterZoom)) Log.d('no map-data event after the auto-zoom; checking the road count instead');
           await WazeData.refresh(true);
           zoom = await MapUtil.zoom();
           if (zoom !== null && zoom < need) {
             throw new Error(`Still at zoom ${zoom} (needed ${need}); WME refused to zoom. Zoom in manually and Scan again.`);
           }
+        }
+        // Roads for the new view may still be arriving (after an auto-zoom or a recent pan). Scanning now
+        // would miss them and propose candidates on roads that are already mapped.
+        UI.setBusy(true, 'Waiting for WME to finish loading the roads...');
+        {
+          // Ready = the road count in view has not changed over two checks and no map-data event arrived
+          // for 0.9 s.
+          let prevN = -1, stable = 0;
+          const giveUp = Date.now() + 8000;
+          while (Date.now() < giveUp) {
+            await WazeData.refresh(true);
+            const n = WazeData.inBox(await MapUtil.extent()).length;
+            const quiet = Date.now() - MapLoad.lastAt >= 900;
+            // An empty view must stay empty much longer (about 3 s): at zoom 16 WME can take a while to
+            // deliver the first segments, and accepting "0 roads" too early is how candidates end up on mapped roads.
+            const need = (n === 0 && WazeData.all().length === 0) ? 6 : 2;
+            if (n === prevN && quiet) { if (++stable >= need) break; } else stable = 0;
+            prevN = n;
+            await sleep(500);
+          }
+          if (Date.now() >= giveUp) Log.w('road data was still changing after 8 s; scanning with what is loaded');
         }
         let extent = await MapUtil.extent();
         if (!WazeData.all().length) { await sleep(700); await WazeData.refresh(true); }
@@ -1356,6 +1381,16 @@
   const MapLoad = {
     waiters: new Set(),
     lastAt: 0,
+    // Resolves once WME has sent no map-data event for quietMs (or after maxMs). Used so a scan or a
+    // convert does not read the road data while WME is still loading it after a zoom or pan.
+    async settle(quietMs = 900, maxMs = 8000) {
+      const end = Date.now() + maxMs;
+      while (Date.now() < end) {
+        if (Date.now() - this.lastAt >= quietMs) return true;
+        await sleep(150);
+      }
+      return false;
+    },
     notify() { this.lastAt = Date.now(); this.waiters.forEach((w) => w()); },
     wait({ timeoutMs = 10000, quietMs = 600 } = {}) {
       return new Promise((resolve) => {
@@ -1381,6 +1416,16 @@
   async function editCount() {
     try { let n = sdk.Editing.getUnsavedChangesCount(); if (isPromise(n)) n = await n; return typeof n === 'number' ? n : null; }
     catch (e) { return null; }
+  }
+
+  async function editingDraft() {
+    try {
+      let sel = sdk.Editing.getSelection(); if (isPromise(sel)) sel = await sel;
+      if (!sel || sel.objectType !== 'segment' || !Array.isArray(sel.ids)) return false;
+      const mine = new Set();
+      State.generated.forEach((g) => (g.allIds || []).forEach((i) => mine.add(i)));
+      return sel.ids.some((i) => mine.has(i) || (typeof i === 'number' && i < 0));
+    } catch (e) { return false; }
   }
 
   const Generated = {
@@ -1860,7 +1905,7 @@
 
     async reconcile(quiet) {
       if (this.busy && !quiet) { this.again = true; return; }
-      let changed = false;
+      let changed = false, recheck = false;
       await WazeData.refresh();
       for (const row of [...State.generated.values()]) {
         if (row.status === 'Error' || !row.allIds) continue;
@@ -1875,6 +1920,7 @@
           continue;
         }
         if (present.length) {
+          row._absentSince = null;
           if (present.join() !== row.segmentIds.join()) { row.segmentIds = present; row.segmentId = present[0]; changed = true; }
           continue;
         }
@@ -1886,11 +1932,44 @@
           if (row.segmentIds.length) { row.segmentId = row.segmentIds[0]; changed = true; Log.i(`${row.id} follows its edited segment(s): ${row.segmentIds.join(',')}`); }
           continue;
         }
+        // The editor may have reshaped or reconnected the draft, which can give it new IDs and move it
+        // well away from where it was created. Adopt such a segment before deciding it was undone.
+        if (await this.adoptEdited(row)) { row._absentSince = null; changed = true; continue; }
+        // Other scripts (road type, river tools...) edit a draft in several steps, so it can be missing
+        // for a moment. Only call it undone if it is still missing a second later.
+        if (!row._absentSince) { row._absentSince = Date.now(); recheck = true; continue; }
+        if (Date.now() - row._absentSince < 1000) { recheck = true; continue; }
+        row._absentSince = null;
         row.status = 'Undone'; row.segmentIds = []; row.selected = false; changed = true;
         if (this.restoreCandidate(row.cand)) UI.notify(`${row.id} was undone in WME: candidate ${row.cand.id} is back in the list.`, 'ok');
       }
       if (changed) UI.changed();
+      if (recheck) setTimeout(() => this.reconcile().catch(() => {}), 1200);
       if (this.again) { this.again = false; setTimeout(() => this.reconcile().catch(() => {}), 200); }
+    },
+
+    // Finds the unsaved segment(s) the editor turned a draft into: new (negative-ID) segments that no other
+    // row owns and that lie along the original draft line (within 40 m).
+    async adoptEdited(row) {
+      await WazeData.refresh(true);
+      const claimed = new Set();
+      State.generated.forEach((g) => { if (g !== row && g.allIds) g.allIds.forEach((i) => claimed.add(i)); });
+      const rowPts = Geo.densify(row.coords, 6);
+      const mine = WazeData.all().filter((sg) => {
+        if (typeof sg.id !== 'number' || sg.id >= 0) return false;
+        if (!claimed.has(sg.id)) {
+          const pts = Geo.densify(sg.coords, 6);
+          return pts.filter((p) => { const r = Geo.nearestOnLine(p, row.coords); return r && r.dist <= 40; }).length / pts.length >= 0.6;
+        }
+        // Already owned by another draft record: the editor merged two drafts into one segment. That
+        // segment then runs along this draft's line too, so this record shares it instead of being undone.
+        return rowPts.filter((p) => { const r = Geo.nearestOnLine(p, sg.coords); return r && r.dist <= 12; }).length / rowPts.length >= 0.85;
+      }).map((sg) => sg.id);
+      if (!mine.length) return false;
+      row.segmentIds = mine; row.segmentId = mine[0];
+      mine.forEach((i) => { if (!row.allIds.includes(i)) row.allIds.push(i); });
+      Log.d(`${row.id} follows its edited segment(s): ${mine.join(',')}`);
+      return true;
     },
 
     scheduleReconcile() {
@@ -2427,7 +2506,7 @@
           <button class="primary wide" data-action="convert" ${off || (selC ? '' : 'disabled')} title="Turn the ticked candidates into editable WME segments. Repeat as needed — the script only warns near WME's technical limit; Save clears it.">Convert${selC ? ` (${selC})` : ''}</button>
           <button class="danger" data-action="remove-sel" ${off || (nSel ? '' : 'disabled')} title="Remove everything ticked below">Remove${nSel ? ` (${nSel})` : ''}</button>
         </div>
-        <div class="sub" style="margin-bottom:4px">Draft proposal tool for manual editing. No automatic writes; no modification of existing map data. Designed to follow the Waze Guidelines for Bulk Editing Scripts: the tool proposes, the editor decides.</div>
+        <div class="sub" style="margin-bottom:4px">Draft proposal tool for manual editing. No automatic writes; no modification of existing map data. Built to assist a human editor, not to mass-edit: the tool proposes, the editor decides.</div>
         ${this._checkpointHtml()}
         <details class="notes"><summary>Manual review only</summary>
         <div class="notice"><b>Manual review only.</b> The script proposes draft segments; <b>you</b> decide what to keep, correct, and save. It is not an automated editor.</div>
@@ -2602,11 +2681,16 @@
   function wireMapEvents() {
     sdk.Events.on({
       eventName: 'wme-layer-feature-clicked',
-      eventHandler: ({ featureId, layerName }) => {
+      eventHandler: async ({ featureId, layerName }) => {
         if (layerName !== LAYER_CANDIDATE || typeof featureId !== 'string') return;
         const m = /^(C-\d+)(?:-|$)/.exec(featureId);   // line, arrow and junction-dot ids all start with the candidate id
         const c = State.candidates.get(m ? m[1] : featureId);
-        if (c && c.status === 'Candidate') { c.selected = !c.selected; UI.changed(); }
+        if (!c || c.status !== 'Candidate') return;
+        // While the editor works on a draft segment, a click that lands on a nearby candidate line is
+        // part of that edit (dragging a node, selecting the draft), not a request to tick the candidate.
+        await sleep(60);
+        if (await editingDraft()) { Log.d(`ignored click on ${c.id}: a draft segment is selected`); return; }
+        c.selected = !c.selected; UI.changed();
       }
     });
     sdk.Events.on({
@@ -2755,7 +2839,7 @@
 
       UI.changed();
       W.__SVRA__ = { State, Settings, Geo, Junctions, Chain, Candidates, Generated, Coverage };
-      Log.i('Initialised v1.0.0-beta (build 2026-11-06-i: stop button, convert zoom setting)');
+      Log.i('Initialised v1.0.0-beta (build 2026-11-07-m: merged drafts, empty-view wait, author defaults)');
     } catch (err) {
       Log.e('Initialisation failed', err);
     }
